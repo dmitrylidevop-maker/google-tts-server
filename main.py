@@ -8,25 +8,100 @@ Supports multiple languages and voices with streaming audio responses.
 import os
 import logging
 import base64
+import socket
+import asyncpg
+import json
 from typing import List, Optional, Dict, Any
 from io import BytesIO
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, validator
 from google.cloud import texttospeech
 from google.api_core import exceptions as gcp_exceptions
+from dotenv import load_dotenv
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
+
+# Database config
+DB_HOST = os.getenv("PG_HOST", "192.168.31.129")
+DB_PORT = int(os.getenv("PG_PORT", "5435"))
+DB_USER = os.getenv("PG_USER", "postgres")
+DB_PASS = os.getenv("PG_PASS", "postgres")
+DB_NAME = os.getenv("PG_DB", "postgres")
+
 app = FastAPI(
     title="Google TTS Server",
     description="Text-to-Speech API using Google Cloud TTS",
     version="1.0.0",
 )
+
+db_pool = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db_pool
+    db_pool = await asyncpg.create_pool(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASS,
+        database=DB_NAME,
+        min_size=1,
+        max_size=5,
+    )
+    logger.info(f"Connected to PostgreSQL at {DB_HOST}:{DB_PORT}")
+    yield
+    if db_pool:
+        await db_pool.close()
+        logger.info("PostgreSQL pool closed")
+
+app = FastAPI(
+    title="Google TTS Server",
+    description="Text-to-Speech API using Google Cloud TTS",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+async def log_activity(
+    service_name: str,
+    activity_type: str,
+    request: dict,
+    response: dict,
+    status: str,
+    user: Optional[str] = None,
+):
+    global db_pool
+    if not db_pool:
+        logger.warning("DB pool not initialized, skipping activity log")
+        return
+    host = socket.gethostname()
+    try:
+        # Serialize request/response to JSON string for jsonb columns
+        request_json = json.dumps(request, ensure_ascii=False)
+        response_json = json.dumps(response, ensure_ascii=False)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO public.activity_log (service_name, activity_type, request, response, status, "user", host)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                service_name,
+                activity_type,
+                request_json,
+                response_json,
+                status,
+                user,
+                host,
+            )
+    except Exception as e:
+        logger.error(f"Failed to log activity: {e}")
 
 # Initialize Google TTS client
 try:
@@ -44,11 +119,17 @@ class TTSRequest(BaseModel):
     speed: Optional[float] = Field(1.0, ge=0.25, le=4.0, description="Speech speed (0.25-4.0)")
     pitch: Optional[float] = Field(0.0, ge=-20.0, le=20.0, description="Voice pitch (-20.0 to 20.0)")
 
-    @validator('text')
-    def validate_text(cls, v):
-        if not v or not v.strip():
+    @classmethod
+    def __get_validators__(cls):
+        yield cls.validate_text_field
+
+    @staticmethod
+    def validate_text_field(values):
+        text = values.get('text')
+        if not text or not text.strip():
             raise ValueError('Text cannot be empty')
-        return v.strip()
+        values['text'] = text.strip()
+        return values
 
 
 class VoiceInfo(BaseModel):
@@ -200,11 +281,8 @@ async def synthesize_speech(request: TTSRequest):
             voice=voice_params,
             audio_config=audio_config
         )
-        
-        # Create streaming response
         audio_stream = BytesIO(response.audio_content)
-        
-        return StreamingResponse(
+        result = StreamingResponse(
             BytesIO(response.audio_content),
             media_type="audio/mpeg",
             headers={
@@ -212,15 +290,45 @@ async def synthesize_speech(request: TTSRequest):
                 "Content-Length": str(len(response.audio_content))
             }
         )
+        # Log activity
+        await log_activity(
+            service_name="tts-server",
+            activity_type="tts",
+            request=request.dict(),
+            response={"size": len(response.audio_content)},
+            status="success",
+        )
+        return result
         
     except gcp_exceptions.InvalidArgument as e:
         logger.error(f"Invalid argument error: {e}")
+        await log_activity(
+            service_name="tts-server",
+            activity_type="tts",
+            request=request.dict(),
+            response={"error": str(e)},
+            status="invalid_argument",
+        )
         raise HTTPException(status_code=400, detail=f"Invalid voice or parameters: {e}")
     except gcp_exceptions.GoogleAPICallError as e:
         logger.error(f"Google API call error: {e}")
+        await log_activity(
+            service_name="tts-server",
+            activity_type="tts",
+            request=request.dict(),
+            response={"error": str(e)},
+            status="api_error",
+        )
         raise HTTPException(status_code=503, detail=f"Google TTS API error: {e}")
     except Exception as e:
         logger.error(f"Unexpected error during synthesis: {e}")
+        await log_activity(
+            service_name="tts-server",
+            activity_type="tts",
+            request=request.dict(),
+            response={"error": str(e)},
+            status="error",
+        )
         raise HTTPException(status_code=500, detail="Text-to-speech synthesis failed")
 
 
@@ -261,24 +369,51 @@ async def synthesize_speech_base64(request: TTSRequest):
             voice=voice_params,
             audio_config=audio_config,
         )
-
         audio_bytes = response.audio_content
         audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
-
-        return Base64TTSResponse(
+        result = Base64TTSResponse(
             audio_base64=audio_b64,
             content_type="audio/mpeg",
             size=len(audio_bytes),
         )
+        await log_activity(
+            service_name="tts-server",
+            activity_type="tts_base64",
+            request=request.dict(),
+            response={"size": len(audio_bytes)},
+            status="success",
+        )
+        return result
 
     except gcp_exceptions.InvalidArgument as e:
         logger.error(f"Invalid argument error (base64): {e}")
+        await log_activity(
+            service_name="tts-server",
+            activity_type="tts_base64",
+            request=request.dict(),
+            response={"error": str(e)},
+            status="invalid_argument",
+        )
         raise HTTPException(status_code=400, detail=f"Invalid voice or parameters: {e}")
     except gcp_exceptions.GoogleAPICallError as e:
         logger.error(f"Google API call error (base64): {e}")
+        await log_activity(
+            service_name="tts-server",
+            activity_type="tts_base64",
+            request=request.dict(),
+            response={"error": str(e)},
+            status="api_error",
+        )
         raise HTTPException(status_code=503, detail=f"Google TTS API error: {e}")
     except Exception as e:
         logger.error(f"Unexpected error during base64 synthesis: {e}")
+        await log_activity(
+            service_name="tts-server",
+            activity_type="tts_base64",
+            request=request.dict(),
+            response={"error": str(e)},
+            status="error",
+        )
         raise HTTPException(status_code=500, detail="Text-to-speech base64 synthesis failed")
 
 
