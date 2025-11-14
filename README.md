@@ -54,23 +54,49 @@ python main.py
 # Build the image
 docker build -t google-tts-server .
 
-# Run with credentials mounted
+# Recommended approach: Load credentials from .env and run with your user/group ID
+source .env
 docker run -d \
   -p 3010:3010 \
-  -v "$GOOGLE_APPLICATION_CREDENTIALS:/app/credentials.json:ro" \
+  --env-file .env \
   -e GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json \
+  -v "${GOOGLE_APPLICATION_CREDENTIALS}:/app/credentials.json:ro" \
+  --user 1000:10 \
   --name tts-server \
   google-tts-server
-```
 
-### 4. Docker Compose (Recommended)
+# Alternative: Run with explicit path (replace with your credentials path)
+docker run -d \
+  -p 3010:3010 \
+  --env-file .env \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json \
+  -v "/absolute/path/to/credentials.json:/app/credentials.json:ro" \
+  --user 1000:10 \
+  --name tts-server \
+  google-tts-server
 
-```bash
-# Copy your credentials
-cp /path/to/your/credentials.json ./gcp-credentials.json
+# Or run as root if you encounter permission issues (less secure)
+docker run -d \
+  -p 3010:3010 \
+  --env-file .env \
+  --user root \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json \
+  -v "/absolute/path/to/credentials.json:/app/credentials.json:ro" \
+  --name tts-server \
+  google-tts-server
 
-# Start the service
-docker-compose up -d
+# Or run with individual environment variables (no .env file needed)
+docker run -d \
+  -p 3010:3010 \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json \
+  -e PG_HOST=192.168.31.129 \
+  -e PG_PORT=5435 \
+  -e PG_USER=postgres \
+  -e PG_PASS=yourpassword \
+  -e PG_DB=postgres \
+  -v "/absolute/path/to/your/credentials.json:/app/credentials.json:ro" \
+  --name tts-server \
+  google-tts-server
 ```
 
 ## API Documentation
